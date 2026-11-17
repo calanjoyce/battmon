@@ -1,0 +1,11 @@
+[Unit]
+Description=BattMon battery history logger
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/battmon/battlog.py
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=BattMon
+Exec=/opt/battmon/battmon.py
+Terminal=false
+Icon=share/images/battmon.png
+Type=Application
