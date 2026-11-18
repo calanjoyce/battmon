@@ -4,8 +4,13 @@
 Draws straight to the 320x170 RGB565 LCD framebuffer (/dev/fb0) and reads
 the built-in keyboard from evdev, the same way the stock APPLaunch apps do.
 
-Keys:  1-4  graph range (10 min / 1 h / 6 h / 24 h)
+Two screens (Tab switches): the battery with a history graph, and Usage,
+an estimate of what the power went on (screen, CPU and the processes using
+it, radios, ...) worked out from battlog.py's usage log by usage.py.
+
+Keys:  1-4  time range (10 min / 1 h / 6 h / 24 h)
        G    toggle graph: charge % / current mA
+       Tab  battery / usage screen
        Esc, Q, Backspace  quit
 """
 import os
@@ -19,6 +24,9 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import numpy as np  # noqa: E402
 import pygame  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import usage  # noqa: E402
+
 W, H = 320, 170
 FB = os.environ.get("BATTMON_FB", "/dev/fb0")
 KBD = os.environ.get(
@@ -30,6 +38,7 @@ RANGES = [("10m", 600), ("1h", 3600), ("6h", 6 * 3600), ("24h", 24 * 3600)]
 
 # Linux input key codes
 K_ESC, K_1, K_2, K_3, K_4, K_BKSP, K_Q, K_G = 1, 2, 3, 4, 5, 14, 16, 34
+K_TAB = 15
 
 BG = (12, 14, 18)
 PANEL = (28, 32, 40)
@@ -122,6 +131,11 @@ def fmt_dur(sec):
     return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
 
 
+def usage_fmt(sec):
+    m = int(sec // 60)
+    return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m} min"
+
+
 def level_color(pct):
     if pct is None:
         return DIM
@@ -140,6 +154,8 @@ class App:
         self.graph_current = False
         self.live = []  # (t, pct, ua) samples taken while running
         self.hist_cache = (0, None, [])
+        self.screen = "battery"
+        self.usage_cache = (0, None, None)
         self.fb = os.open(FB, os.O_RDWR)
         try:
             self.kbd = os.open(KBD, os.O_RDONLY | os.O_NONBLOCK)
@@ -172,6 +188,9 @@ class App:
         elif code in (K_1, K_2, K_3, K_4):
             self.range_i = code - K_1
             self.hist_cache = (0, None, [])
+            self.usage_cache = (0, None, None)
+        elif code == K_TAB:
+            self.screen = "usage" if self.screen == "battery" else "battery"
         elif code == K_G:
             self.graph_current = not self.graph_current
 
@@ -302,7 +321,7 @@ class App:
                   (gx + gw - 4, gy + 2), "topright")
 
     def draw_footer(self):
-        hint = "1-4 range   G graph   Esc quit"
+        hint = "1-4 range   G graph   Tab usage   Esc quit"
         self.text(self.f_lbl, hint, DIM, (W // 2, H - 2), "midbottom")
         self.text(self.f_lbl, time.strftime("%H:%M"), DIM, (W - 6, H - 2),
                   "bottomright")
@@ -315,11 +334,77 @@ class App:
                 self.live.append((now, b["pct"], b["ua"]))
                 self.live = self.live[-2000:]
         self.s.fill(BG)
-        self.draw_battery(b)
-        self.draw_stats(b)
-        self.draw_graph()
-        self.draw_footer()
+        if self.screen == "usage":
+            self.draw_usage()
+        else:
+            self.draw_battery(b)
+            self.draw_stats(b)
+            self.draw_graph()
+            self.draw_footer()
         self.flush()
+
+    # ---------- usage screen ----------
+    def usage_summary(self):
+        name, span = RANGES[self.range_i]
+        ts, key, sm = self.usage_cache
+        if sm is None or key != span or time.time() - ts > 20:
+            sm = usage.summary(span)
+            self.usage_cache = (time.time(), span, sm)
+        return sm
+
+    def draw_usage(self):
+        name, span = RANGES[self.range_i]
+        sm = self.usage_summary()
+        self.text(self.f_mid, f"Usage \u00b7 last {name}", TEXT, (8, 4))
+        foot = "1-4 range   Tab battery   ~ typical value   Esc"
+        if sm["total"] <= 0 or sm["hours"] <= 0:
+            self.text(self.f_sm, "collecting usage data\u2026", DIM,
+                      (W // 2, 70), "center")
+            self.text(self.f_lbl, "The logger records every 30 s while on "
+                      "battery.", DIM, (W // 2, 88), "center")
+            self.text(self.f_lbl, foot, DIM, (W // 2, H - 2), "midbottom")
+            return
+        avg = sm["total"] / sm["hours"]
+        cover = sm["hours"] * 3600
+        info = f"{sm['total']:.0f} mAh \u00b7 avg {avg:.0f} mA"
+        if cover < span * 0.9:
+            info += f" \u00b7 {usage_fmt(cover)} logged"
+        self.text(self.f_sm, info, DIM, (W - 6, 6), "topright")
+
+        rows = []
+        for key, label in sorted(usage.PARTS,
+                                 key=lambda kv: -sm["parts"][kv[0]]):
+            mah = sm["parts"][key]
+            if mah <= 0.005 * sm["total"]:
+                continue
+            typical = key in usage.FEATURES and key not in sm["measured"]
+            rows.append((label + (" ~" if typical else ""), mah, typical, 0))
+            if key == "cpu":
+                procs = sorted(sm["procs"].items(), key=lambda kv: -kv[1])
+                for pname, pm in procs[:3]:
+                    if pm >= 0.01 * sm["total"]:
+                        rows.append((pname[:18], pm, typical, 1))
+        top = max(r[1] for r in rows) if rows else 1
+        y = 24
+        for label, mah, typical, indent in rows[:9]:
+            if y > H - 22:
+                break
+            pct = mah / sm["total"] * 100
+            f = self.f_lbl if indent else self.f_sm
+            col = DIM if indent else TEXT
+            self.text(f, ("   " if indent else "") + label, col, (8, y))
+            bx, bw = 132, 104
+            w = max(2, int(bw * mah / top))
+            bar = (80, 120, 190) if indent else (GRID if typical else BLUE)
+            pygame.draw.rect(self.s, PANEL, (bx, y + 3, bw, 7),
+                             border_radius=3)
+            pygame.draw.rect(self.s, bar, (bx, y + 3, w, 7),
+                             border_radius=3)
+            self.text(f, f"{pct:.0f}%", col, (272, y), "topright")
+            self.text(f, f"{mah:.1f}" if mah < 10 else f"{mah:.0f}", DIM,
+                      (W - 6, y), "topright")
+            y += 13 if indent else 15
+        self.text(self.f_lbl, foot, DIM, (W // 2, H - 2), "midbottom")
 
     def flush(self):
         a = pygame.surfarray.pixels3d(self.s)  # (W, H, 3)
